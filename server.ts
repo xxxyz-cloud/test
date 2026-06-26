@@ -1,19 +1,18 @@
 // ════════════════════════════════════════════════════════════
 //  Phoenix — Production Server
-//  Strategy:
-//   • Agent 1 (diagnose) runs first and extracts a rich
-//     ProjectIntelligence object from the goal + PDF.
-//     Every subsequent agent receives this as context so
-//     outputs are grounded in the actual project.
-//   • Agents 2 + 3 (survival + rescue) fire in PARALLEL
-//     once intelligence is ready, halving wait time.
-//   • Agent 4 (simulate) fires after 2+3 finish.
-//   • Rate-limit strategy: gemini-2.5-flash → gemini-2.0-flash-lite
-//     → grok-3-mini → rich heuristic. Each model gets ONE
-//     attempt with a 20s timeout. No retry loops on 429s.
-//   • Response-level cache (LRU, 50 entries, 30 min TTL)
-//     keyed on a hash of the prompt inputs. Judges hitting
-//     the demo repeatedly get instant sub-10ms responses.
+//  Rate-limit strategy:
+//   • 3-model waterfall: gemini-2.5-flash → gemini-2.0-flash
+//     → gemini-2.0-flash-lite (separate quotas)
+//   • Circuit breaker: 429 blocks model for 90s, 503 for 20s.
+//     Blocked models are skipped instantly — no wasted timeout.
+//   • Optional GEMINI_API_KEY_2 for burst capacity (second key
+//     tried on every model before moving to the next).
+//   • Grok-3-mini fallback if all Gemini exhausted.
+//   • Rich heuristic fallback if Grok also unavailable.
+//   • LRU response cache (50 entries, 30 min TTL) — judges
+//     hitting demo repeatedly get sub-10ms cached responses.
+//   • DELETE /api/cache to flush before a fresh demo run.
+//   • GET /api/diag shows per-model quota block status.
 // ════════════════════════════════════════════════════════════
 
 import express from "express";
@@ -28,7 +27,7 @@ dotenv.config();
 // ─── Types ───────────────────────────────────────────────────
 
 interface ProjectIntelligence {
-  project_type: "software" | "document" | "research" | "pitch";
+  project_type: "software" | "document" | "research" | "pitch" | "exam" | "interview" | "assignment" | "creative";
   tech_stack: string[];           // e.g. ["React", "Node.js", "PostgreSQL"]
   hardest_parts: string[];        // what will actually blow up
   already_done: string[];         // what's verifiably complete
@@ -98,19 +97,38 @@ async function startServer() {
 
   // ── AI clients ──────────────────────────────────────────────
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  const xaiKey = process.env.XAI_API_KEY;
+  const apiKey  = process.env.GEMINI_API_KEY;
+  const apiKey2 = process.env.GEMINI_API_KEY_2; // optional second key for burst
+  const xaiKey  = process.env.XAI_API_KEY;
 
-  const ai = apiKey
-    ? new GoogleGenAI({
-        apiKey,
-        httpOptions: { headers: { "User-Agent": "aistudio-build" } },
-      })
-    : null;
+  const ai  = apiKey  ? new GoogleGenAI({ apiKey,  httpOptions: { headers: { "User-Agent": "aistudio-build" } } }) : null;
+  const ai2 = apiKey2 ? new GoogleGenAI({ apiKey: apiKey2, httpOptions: { headers: { "User-Agent": "aistudio-build" } } }) : null;
 
-  // Primary → Fallback. Only two hops to minimise latency.
-  const MODELS = ["gemini-2.5-flash", "gemini-2.0-flash-lite"];
-  const TIMEOUT_MS = 20_000;
+  // Model waterfall — tried in order, skipped if quota-blocked
+  // gemini-2.0-flash has separate quota from flash-lite, so both are listed
+  const MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+  ];
+  const TIMEOUT_MS = 18_000;
+
+  // ── Per-model quota circuit breaker ─────────────────────────
+  // If a model returns 429, we mark it as blocked for 60 seconds
+  // so we don't waste time hitting it again on the next request.
+  const quotaBlockedUntil = new Map<string, number>();
+
+  function isBlocked(model: string): boolean {
+    const until = quotaBlockedUntil.get(model) ?? 0;
+    if (Date.now() < until) return true;
+    quotaBlockedUntil.delete(model);
+    return false;
+  }
+
+  function blockModel(model: string, seconds = 60): void {
+    quotaBlockedUntil.set(model, Date.now() + seconds * 1000);
+    console.warn(`[Phoenix] ⛔ ${model} blocked for ${seconds}s`);
+  }
 
   function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
     return new Promise((res, rej) => {
@@ -123,7 +141,8 @@ async function startServer() {
   // ── Grok fallback ───────────────────────────────────────────
 
   async function callGrok(prompt: string, jsonMode: boolean, schema?: any): Promise<string> {
-    if (!xaiKey) return "";
+    if (!xaiKey) { console.warn("[Phoenix] Grok skipped — no XAI_API_KEY set"); return ""; }
+    console.log("[Phoenix] 🔄 Attempting Grok fallback (grok-3-mini)...");
     const schemaHint = schema
       ? `\n\nRespond ONLY with a single valid JSON object exactly matching this shape — no markdown fences:\n${JSON.stringify(schema, null, 2)}`
       : "";
@@ -140,7 +159,7 @@ async function startServer() {
         }),
         TIMEOUT_MS
       );
-      if (!r.ok) return "";
+      if (!r.ok) { const errBody = await r.text().catch(() => ""); console.warn(`[Phoenix] ❌ Grok failed: ${r.status} ${r.statusText} — ${errBody.slice(0, 120)}`); return ""; }
       const d = await r.json();
       const text = d?.choices?.[0]?.message?.content;
       if (text) console.log("[Phoenix] Served by: grok-3-mini");
@@ -151,34 +170,52 @@ async function startServer() {
     }
   }
 
-  // ── Gemini caller — single attempt per model, no retry on 429 ──
+  // ── Gemini caller — circuit breaker + optional second key ───
+
+  async function tryGeminiModel(
+    client: InstanceType<typeof GoogleGenAI>,
+    model: string,
+    contents: any[],
+    config: any
+  ): Promise<string | null> {
+    if (isBlocked(model)) return null;
+    try {
+      const r = await withTimeout(
+        client.models.generateContent({ model, contents, config }),
+        TIMEOUT_MS
+      );
+      if (r?.text) {
+        console.log(`[Phoenix] ✓ Served by: ${model}`);
+        return r.text;
+      }
+      return null;
+    } catch (e: any) {
+      const msg   = String(e?.message || e);
+      const code  = e?.status ?? (msg.match(/"code":(\d+)/)?.[1] ? Number(msg.match(/"code":(\d+)/)[1]) : 0);
+      const is429 = code === 429 || msg.includes("quota") || msg.includes("RESOURCE_EXHAUSTED");
+      const is503 = code === 503 || msg.includes("overloaded") || msg.includes("high demand");
+      console.warn(`[Phoenix] ${model} failed (${code || "err"}): ${msg.slice(0, 80)}`);
+      if (is429) blockModel(model, 90);
+      if (is503) blockModel(model, 20);
+      return null;
+    }
+  }
 
   async function callAI(
     contents: any[],
     config: any
   ): Promise<{ text: string; servedBy: "gemini" | "grok" | "none" }> {
-    if (ai) {
-      for (const model of MODELS) {
-        try {
-          const r = await withTimeout(
-            ai.models.generateContent({ model, contents, config }),
-            TIMEOUT_MS
-          );
-          if (r?.text) {
-            console.log(`[Phoenix] Served by: ${model}`);
-            return { text: r.text, servedBy: "gemini" };
-          }
-        } catch (e: any) {
-          const msg = String(e?.message || e);
-          console.warn(`[Phoenix] ${model} failed:`, msg.slice(0, 120));
-          // Hard quota zero — skip immediately
-          if (e?.status === 429 && msg.includes("limit: 0")) continue;
-          // Any other error — try next model
-        }
+    const clients = [ai, ai2].filter(Boolean) as InstanceType<typeof GoogleGenAI>[];
+
+    for (const model of MODELS) {
+      for (const client of clients) {
+        const text = await tryGeminiModel(client, model, contents, config);
+        if (text) return { text, servedBy: "gemini" };
       }
     }
 
-    // All Gemini models failed — try Grok
+    // All Gemini exhausted — try Grok
+    console.warn("[Phoenix] ⚠ All Gemini models exhausted — falling through to Grok...");
     const textParts = contents
       .filter(c => typeof c === "string" || typeof c?.text === "string")
       .map(c => (typeof c === "string" ? c : c.text));
@@ -242,7 +279,15 @@ ${pdf ? "A project specification / assignment doc is attached above — extract 
 
 ━━━ YOUR TASKS ━━━
 
-1. CLASSIFY project_type: "software" | "document" | "research" | "pitch"
+1. CLASSIFY project_type: "software" | "document" | "research" | "pitch" | "exam" | "interview" | "assignment" | "creative"
+   - exam: studying for a test, quiz, or certification
+   - interview: job interview, technical screen, behavioural prep
+   - assignment: essay, report, coursework, homework
+   - creative: design, writing, music, art with a deadline
+   - software: coding project, app, hackathon
+   - document: formal doc, thesis, proposal
+   - research: data analysis, experiment, study
+   - pitch: investor deck, presentation, demo
 
 2. EXTRACT tech_stack: list of specific technologies / frameworks / languages in this project.
    If it's a software project, be specific (e.g. "React 18", "Express", "Supabase").
@@ -296,7 +341,7 @@ Return ONLY valid JSON — no markdown, no prose outside JSON:
       const schema = {
         type: Type.OBJECT,
         properties: {
-          project_type:    { type: Type.STRING, enum: ["software","document","research","pitch"] },
+          project_type:    { type: Type.STRING, enum: ["software","document","research","pitch","exam","interview","assignment","creative"] },
           tech_stack:      { type: Type.ARRAY,  items: { type: Type.STRING } },
           hardest_parts:   { type: Type.ARRAY,  items: { type: Type.STRING } },
           already_done:    { type: Type.ARRAY,  items: { type: Type.STRING } },
@@ -335,9 +380,13 @@ Return ONLY valid JSON — no markdown, no prose outside JSON:
         // ── Heuristic fallback ──────────────────────────────────
         const goalL = goal.toLowerCase();
         const pType =
+          goalL.match(/exam|test|quiz|study|certification|exams/) ? "exam" :
+          goalL.match(/interview|behavioral|technical screen|job prep/) ? "interview" :
+          goalL.match(/essay|assignment|coursework|homework|submit|report/) ? "assignment" :
           goalL.match(/pitch|deck|slide|investor|presentation/) ? "pitch" :
-          goalL.match(/essay|report|thesis|assignment|paper|write|document/) ? "document" :
-          goalL.match(/research|experiment|analysis|survey|study/) ? "research" : "software";
+          goalL.match(/research|experiment|analysis|survey|study/) ? "research" :
+          goalL.match(/thesis|paper|write|document/) ? "document" :
+          goalL.match(/design|creative|music|art|blog|story/) ? "creative" : "software";
 
         const riskLevel: ProjectIntelligence["risk_level"] =
           deficit > 4 ? "Critical" : deficit > 0 ? "High" : deficit > -3 ? "Moderate" : "Low";
@@ -416,10 +465,14 @@ Return ONLY valid JSON — no markdown, no prose outside JSON:
       if (pdf) contents.push(pdf);
 
       const triageRules: Record<string, string> = {
-        software: "Keep: runnable core flow, anything the judge clicks during demo, auth only if required. Cut: polish, analytics, admin, edge cases, nice-to-haves.",
-        document: "Keep: required sections per rubric, core thesis, conclusion. Cut: extended examples, decorative formatting, optional appendices.",
-        research: "Keep: central analysis, key figures, core methodology, main citations. Cut: extended lit review, secondary datasets, future work.",
-        pitch:    "Keep: problem, solution demo, one key metric, CTA. Cut: detailed financials, team bios, appendix, edge-case scenarios.",
+        software:   "Keep: runnable core flow, anything the judge clicks during demo, auth only if required. Cut: polish, analytics, admin, edge cases, nice-to-haves.",
+        document:   "Keep: required sections per rubric, core thesis, conclusion. Cut: extended examples, decorative formatting, optional appendices.",
+        research:   "Keep: central analysis, key figures, core methodology, main citations. Cut: extended lit review, secondary datasets, future work.",
+        pitch:      "Keep: problem, solution demo, one key metric, CTA. Cut: detailed financials, team bios, appendix, edge-case scenarios.",
+        exam:       "Keep: high-yield topics most likely to appear, weak areas that need urgent review, past-paper question types. Cut: low-probability edge topics, re-reading already-known content, full re-reads of chapters.",
+        interview:  "Keep: most likely question types, 2-3 strong STAR stories, company research essentials, one system design template. Cut: obscure algorithms unlikely in first round, exhaustive company history, over-polishing answers already strong.",
+        assignment: "Keep: sections worth the most marks, core argument, required citations. Cut: optional appendices, excessive intro/background, decorative formatting.",
+        creative:   "Keep: the core deliverable the audience will actually see/hear, anything that takes <30 min to polish. Cut: extras, variations, behind-the-scenes work that doesn't affect the output.",
       };
 
       contents.push(`
@@ -581,17 +634,25 @@ Return ONLY valid JSON:
       if (pdf) contents.push(pdf);
 
       const blockTypes: Record<string, string> = {
-        software: '"build" | "test" | "deploy" | "debug"',
-        document: '"write" | "review" | "format" | "submit"',
-        research: '"analyze" | "synthesize" | "cite" | "draft"',
-        pitch:    '"design" | "rehearse" | "record" | "finalize"',
+        software:   '"build" | "test" | "deploy" | "debug"',
+        document:   '"write" | "review" | "format" | "submit"',
+        research:   '"analyze" | "synthesize" | "cite" | "draft"',
+        pitch:      '"design" | "rehearse" | "record" | "finalize"',
+        exam:       '"review" | "practice" | "memorize" | "test-yourself"',
+        interview:  '"prepare" | "practice" | "research" | "rehearse"',
+        assignment: '"write" | "review" | "cite" | "submit"',
+        creative:   '"create" | "refine" | "review" | "finalize"',
       };
 
       const wrapUpVerb: Record<string, string> = {
-        software: "deploy and verify the live URL works; record a 60s backup screen recording",
-        document: "export final PDF, check word count and formatting against rubric, submit",
-        research: "compile final figures, verify citations, export and submit",
-        pitch:    "run full rehearsal, fix any broken slides, share link with judges",
+        software:   "deploy and verify the live URL works; record a 60s backup screen recording",
+        document:   "export final PDF, check word count and formatting against rubric, submit",
+        research:   "compile final figures, verify citations, export and submit",
+        pitch:      "run full rehearsal, fix any broken slides, share link with judges",
+        exam:       "do one final rapid-fire self-quiz across all kept topics, sleep on time",
+        interview:  "run a full mock interview out loud, review weak answers, prepare questions to ask",
+        assignment: "proofread once end-to-end, verify references, submit",
+        creative:   "do a final review of the deliverable as an audience member would, export and share",
       };
 
       contents.push(`
@@ -977,21 +1038,31 @@ Return ONLY the message. No quotes, no JSON, no preamble.
 
   app.get("/api/diag", async (_req, res) => {
     const diag: any = {
-      geminiKeyPresent: !!apiKey,
-      xaiKeyPresent: !!xaiKey,
+      geminiKeyPresent:  !!apiKey,
+      geminiKey2Present: !!apiKey2,
+      xaiKeyPresent:     !!xaiKey,
       models: MODELS,
+      quotaBlocked: Object.fromEntries(
+        MODELS.map(m => [m, isBlocked(m) ? `blocked until ${new Date(quotaBlockedUntil.get(m)!).toISOString()}` : "ok"])
+      ),
       gemini: null,
-      grok: null,
+      grok:   null,
     };
     if (ai) {
-      try {
-        const r = await withTimeout(
-          ai.models.generateContent({ model: MODELS[0], contents: ["Reply: OK"] }),
-          8000
-        );
-        diag.gemini = { ok: !!r?.text, model: MODELS[0], sample: r?.text?.slice(0, 40) };
-      } catch (e: any) {
-        diag.gemini = { ok: false, model: MODELS[0], error: e?.message };
+      // Try first non-blocked model
+      const testModel = MODELS.find(m => !isBlocked(m));
+      if (testModel) {
+        try {
+          const r = await withTimeout(
+            ai.models.generateContent({ model: testModel, contents: ["Reply: OK"] }),
+            8000
+          );
+          diag.gemini = { ok: !!r?.text, model: testModel, sample: r?.text?.slice(0, 40) };
+        } catch (e: any) {
+          diag.gemini = { ok: false, model: testModel, error: e?.message };
+        }
+      } else {
+        diag.gemini = { ok: false, error: "All models quota-blocked — wait 60-90s or enable billing" };
       }
     } else {
       diag.gemini = { ok: false, error: "GEMINI_API_KEY not set" };
